@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS games (
 	agent_white_token TEXT NOT NULL DEFAULT '',
 	human_color TEXT NOT NULL,
 	agent_color TEXT NOT NULL,
+	forbidden INTEGER NOT NULL DEFAULT 0,
+	agent_strategy TEXT NOT NULL DEFAULT 'think',
+	owner_id TEXT NOT NULL DEFAULT '',
 	next_color TEXT NOT NULL,
 	status TEXT NOT NULL,
 	end_reason TEXT NOT NULL DEFAULT '',
@@ -141,7 +144,14 @@ CREATE INDEX IF NOT EXISTS idx_moves_game_number ON moves(game_id, move_number);
 	if err != nil {
 		return err
 	}
-	return s.ensureGameColumns(ctx)
+	if err := s.ensureGameColumns(ctx); err != nil {
+		return err
+	}
+	// Created after ensureGameColumns so the owner_id column is guaranteed to
+	// exist on databases migrated from an older schema.
+	_, err = s.db.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_games_owner_updated ON games(owner_id, updated_at DESC)`)
+	return err
 }
 
 func (s *SQLiteStore) ensureGameColumns(ctx context.Context) error {
@@ -166,6 +176,9 @@ func (s *SQLiteStore) ensureGameColumns(ctx context.Context) error {
 		"agent_white_thinking":       `ALTER TABLE games ADD COLUMN agent_white_thinking INTEGER NOT NULL DEFAULT 0`,
 		"agent_white_thinking_since": `ALTER TABLE games ADD COLUMN agent_white_thinking_since TEXT NOT NULL DEFAULT ''`,
 		"end_reason":                 `ALTER TABLE games ADD COLUMN end_reason TEXT NOT NULL DEFAULT ''`,
+		"forbidden":                  `ALTER TABLE games ADD COLUMN forbidden INTEGER NOT NULL DEFAULT 0`,
+		"agent_strategy":             `ALTER TABLE games ADD COLUMN agent_strategy TEXT NOT NULL DEFAULT 'think'`,
+		"owner_id":                   `ALTER TABLE games ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''`,
 	}
 	for column, statement := range statements {
 		if columns[column] {
@@ -201,7 +214,19 @@ func (s *SQLiteStore) gameColumns(ctx context.Context) (map[string]bool, error) 
 	return columns, rows.Err()
 }
 
-func (s *SQLiteStore) CreateGame(ctx context.Context, mode game.Mode, humanColor game.Color) (game.Game, error) {
+// CreateOptions captures everything chosen in the pre-game setup wizard. Mode
+// defaults to human-agent; AgentStrategy is normalized; OwnerID is the anonymous
+// per-browser identifier used to scope "my games" in the history list.
+type CreateOptions struct {
+	Mode          game.Mode
+	HumanColor    game.Color
+	Forbidden     bool
+	AgentStrategy string
+	OwnerID       string
+}
+
+func (s *SQLiteStore) CreateGame(ctx context.Context, opts CreateOptions) (game.Game, error) {
+	mode := opts.Mode
 	if mode == "" {
 		mode = game.ModeHumanAgent
 	}
@@ -213,17 +238,20 @@ func (s *SQLiteStore) CreateGame(ctx context.Context, mode game.Mode, humanColor
 	}
 
 	g := game.Game{
-		ID:          id,
-		Mode:        mode,
-		NextColor:   game.Black,
-		Status:      game.StatusPlaying,
-		EndReason:   game.EndReasonNone,
-		WinnerColor: game.Empty,
-		WinLine:     []game.Point{},
-		Moves:       []game.Move{},
-		MoveCount:   0,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:            id,
+		Mode:          mode,
+		Forbidden:     opts.Forbidden,
+		AgentStrategy: game.NormalizeStrategy(opts.AgentStrategy),
+		OwnerID:       opts.OwnerID,
+		NextColor:     game.Black,
+		Status:        game.StatusPlaying,
+		EndReason:     game.EndReasonNone,
+		WinnerColor:   game.Empty,
+		WinLine:       []game.Point{},
+		Moves:         []game.Move{},
+		MoveCount:     0,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 	if g.Mode == game.ModeAgentAgent {
 		g.AgentBlackToken, err = game.NewToken()
@@ -235,8 +263,8 @@ func (s *SQLiteStore) CreateGame(ctx context.Context, mode game.Mode, humanColor
 			return game.Game{}, err
 		}
 	} else {
-		g.HumanColor = humanColor
-		g.AgentColor = game.Opposite(humanColor)
+		g.HumanColor = opts.HumanColor
+		g.AgentColor = game.Opposite(opts.HumanColor)
 		g.HumanToken, err = game.NewToken()
 		if err != nil {
 			return game.Game{}, err
@@ -257,12 +285,12 @@ func (s *SQLiteStore) CreateGame(ctx context.Context, mode game.Mode, humanColor
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO games (
 	id, mode, human_token, agent_token, agent_black_token, agent_white_token,
-	human_color, agent_color, next_color,
+	human_color, agent_color, forbidden, agent_strategy, owner_id, next_color,
 	status, end_reason, winner_color, win_line_json, agent_joined_at, agent_last_seen_at,
 	agent_thinking, agent_thinking_since, agent_black_joined_at, agent_black_last_seen_at,
 	agent_black_thinking, agent_black_thinking_since, agent_white_joined_at, agent_white_last_seen_at,
 	agent_white_thinking, agent_white_thinking_since, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		g.ID,
 		g.Mode,
 		g.HumanToken,
@@ -271,6 +299,9 @@ INSERT INTO games (
 		g.AgentWhiteToken,
 		g.HumanColor,
 		g.AgentColor,
+		boolInt(g.Forbidden),
+		g.AgentStrategy,
+		g.OwnerID,
 		g.NextColor,
 		g.Status,
 		g.EndReason,
@@ -308,7 +339,7 @@ func (s *SQLiteStore) ListGames(ctx context.Context, limit int) ([]game.Game, er
 	rows, err := s.db.QueryContext(ctx, `
 SELECT
 	g.id, g.mode, g.human_token, g.agent_token, g.agent_black_token, g.agent_white_token,
-	g.human_color, g.agent_color,
+	g.human_color, g.agent_color, g.forbidden, g.agent_strategy, g.owner_id,
 	g.next_color, g.status, g.end_reason, g.winner_color, g.win_line_json,
 	g.agent_joined_at, g.agent_last_seen_at, g.agent_thinking, g.agent_thinking_since,
 	g.agent_black_joined_at, g.agent_black_last_seen_at, g.agent_black_thinking,
@@ -320,6 +351,49 @@ LEFT JOIN moves m ON m.game_id = g.id
 GROUP BY g.id
 ORDER BY g.updated_at DESC
 LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	games := make([]game.Game, 0)
+	for rows.Next() {
+		g, err := scanGame(rows)
+		if err != nil {
+			return nil, err
+		}
+		games = append(games, g)
+	}
+	return games, rows.Err()
+}
+
+// ListGamesByOwner returns the most recently updated games created by the given
+// anonymous owner, newest first. It backs the "我的对局" view; the unfiltered
+// ListGames backs "全部对局".
+func (s *SQLiteStore) ListGamesByOwner(ctx context.Context, ownerID string, limit int) ([]game.Game, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT
+	g.id, g.mode, g.human_token, g.agent_token, g.agent_black_token, g.agent_white_token,
+	g.human_color, g.agent_color, g.forbidden, g.agent_strategy, g.owner_id,
+	g.next_color, g.status, g.end_reason, g.winner_color, g.win_line_json,
+	g.agent_joined_at, g.agent_last_seen_at, g.agent_thinking, g.agent_thinking_since,
+	g.agent_black_joined_at, g.agent_black_last_seen_at, g.agent_black_thinking,
+	g.agent_black_thinking_since, g.agent_white_joined_at, g.agent_white_last_seen_at,
+	g.agent_white_thinking, g.agent_white_thinking_since,
+	g.created_at, g.updated_at, COUNT(m.id) AS move_count
+FROM games g
+LEFT JOIN moves m ON m.game_id = g.id
+WHERE g.owner_id = ?
+GROUP BY g.id
+ORDER BY g.updated_at DESC
+LIMIT ?`, ownerID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -570,7 +644,7 @@ func (s *SQLiteStore) getGame(ctx context.Context, id string) (game.Game, error)
 	row := s.db.QueryRowContext(ctx, `
 SELECT
 	id, mode, human_token, agent_token, agent_black_token, agent_white_token,
-	human_color, agent_color,
+	human_color, agent_color, forbidden, agent_strategy, owner_id,
 	next_color, status, end_reason, winner_color, win_line_json,
 	agent_joined_at, agent_last_seen_at, agent_thinking, agent_thinking_since,
 	agent_black_joined_at, agent_black_last_seen_at, agent_black_thinking,
@@ -686,6 +760,9 @@ type gameScanner interface {
 
 func scanGame(scanner gameScanner) (game.Game, error) {
 	var g game.Game
+	var forbiddenInt int
+	var agentStrategy string
+	var ownerID string
 	var winLineJSON string
 	var agentJoinedAt string
 	var agentLastSeenAt string
@@ -710,6 +787,9 @@ func scanGame(scanner gameScanner) (game.Game, error) {
 		&g.AgentWhiteToken,
 		&g.HumanColor,
 		&g.AgentColor,
+		&forbiddenInt,
+		&agentStrategy,
+		&ownerID,
 		&g.NextColor,
 		&g.Status,
 		&g.EndReason,
@@ -739,6 +819,9 @@ func scanGame(scanner gameScanner) (game.Game, error) {
 	if g.Mode == "" {
 		g.Mode = game.ModeHumanAgent
 	}
+	g.Forbidden = forbiddenInt != 0
+	g.AgentStrategy = game.NormalizeStrategy(agentStrategy)
+	g.OwnerID = ownerID
 	if err := json.Unmarshal([]byte(winLineJSON), &g.WinLine); err != nil {
 		return game.Game{}, fmt.Errorf("decode win line for game %s: %w", g.ID, err)
 	}

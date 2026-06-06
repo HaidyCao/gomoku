@@ -51,6 +51,14 @@ const (
 	EndReasonFiveInRow   EndReason = "five_in_row"
 	EndReasonDraw        EndReason = "draw"
 	EndReasonResignation EndReason = "resignation"
+	EndReasonForbidden   EndReason = "forbidden"
+)
+
+type AgentStrategy = string
+
+const (
+	StrategyThink  AgentStrategy = "think"
+	StrategyScript AgentStrategy = "script"
 )
 
 var (
@@ -84,6 +92,9 @@ type Game struct {
 	AgentWhiteToken         string     `json:"-"`
 	HumanColor              Color      `json:"humanColor"`
 	AgentColor              Color      `json:"agentColor"`
+	Forbidden               bool       `json:"forbidden"`
+	AgentStrategy           string     `json:"agentStrategy"`
+	OwnerID                 string     `json:"-"`
 	NextColor               Color      `json:"nextColor,omitempty"`
 	Status                  Status     `json:"status"`
 	EndReason               EndReason  `json:"endReason,omitempty"`
@@ -127,6 +138,15 @@ func NormalizeColor(value string) (Color, error) {
 	default:
 		return Empty, fmt.Errorf("unsupported color %q", value)
 	}
+}
+
+// NormalizeStrategy clamps an agent-strategy string to a known value, defaulting
+// anything unrecognized to StrategyThink.
+func NormalizeStrategy(value string) string {
+	if strings.ToLower(strings.TrimSpace(value)) == StrategyScript {
+		return StrategyScript
+	}
+	return StrategyThink
 }
 
 func Opposite(color Color) Color {
@@ -241,17 +261,35 @@ func ApplyMove(g *Game, row int, col int, player Player, now time.Time) (Move, e
 	g.MoveCount = len(g.Moves)
 	board[row][col] = move.Color
 
-	if line := CheckWin(board, row, col, move.Color); len(line) >= 5 {
+	fiveStatus, winLine := classifyFive(board, row, col, move.Color)
+	switch {
+	case fiveStatus == FiveExact:
+		// An exact five always wins for whoever played it.
 		g.Status = WonStatus(move.Color)
 		g.EndReason = EndReasonFiveInRow
 		g.WinnerColor = move.Color
-		g.WinLine = line
+		g.WinLine = winLine
 		g.NextColor = Empty
-	} else if len(g.Moves) == BoardSize*BoardSize {
+	case fiveStatus == FiveOverline && (move.Color == White || !g.Forbidden):
+		// Overline always wins for white, and for black when 禁手 is off
+		// (preserves standard-Gomoku behavior and CheckWin's contract).
+		g.Status = WonStatus(move.Color)
+		g.EndReason = EndReasonFiveInRow
+		g.WinnerColor = move.Color
+		g.WinLine = winLine
+		g.NextColor = Empty
+	case move.Color == Black && g.Forbidden && EvaluateForbidden(board, row, col).Forbidden:
+		// Black landed on a 禁手 point (长连/四四/三三) → black loses immediately.
+		g.Status = StatusWhiteWon
+		g.EndReason = EndReasonForbidden
+		g.WinnerColor = White
+		g.WinLine = []Point{}
+		g.NextColor = Empty
+	case len(g.Moves) == BoardSize*BoardSize:
 		g.Status = StatusDraw
 		g.EndReason = EndReasonDraw
 		g.NextColor = Empty
-	} else {
+	default:
 		g.NextColor = Opposite(move.Color)
 	}
 	g.UpdatedAt = now

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -424,6 +425,172 @@ func TestCreateRateLimit(t *testing.T) {
 	if limited.Code != http.StatusTooManyRequests {
 		t.Fatalf("third create status = %d, want 429; body = %s", limited.Code, limited.Body.String())
 	}
+}
+
+func TestCreateGameForbiddenAndStrategy(t *testing.T) {
+	handler, closeStore := newTestHandler(t)
+	defer closeStore()
+
+	body := bytes.NewBufferString(`{"humanColor":"black","forbidden":true,"agentStrategy":"script"}`)
+	resp := requestJSON(t, handler, http.MethodPost, "/api/games", "", body)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var created GameResponse
+	decodeResponse(t, resp, &created)
+	if !created.Forbidden || created.AgentStrategy != "script" {
+		t.Fatalf("unexpected created options: forbidden=%v strategy=%q", created.Forbidden, created.AgentStrategy)
+	}
+
+	read := requestJSON(t, handler, http.MethodGet, "/api/games/"+created.GameID, "", nil)
+	var readBack GameResponse
+	decodeResponse(t, read, &readBack)
+	if !readBack.Forbidden || readBack.AgentStrategy != "script" {
+		t.Fatalf("options not preserved on read: forbidden=%v strategy=%q", readBack.Forbidden, readBack.AgentStrategy)
+	}
+}
+
+func TestListGamesOwnerFilter(t *testing.T) {
+	handler, closeStore := newTestHandler(t)
+	defer closeStore()
+
+	for i := 0; i < 2; i++ {
+		resp := requestWithOwner(t, handler, http.MethodPost, "/api/games", "owner-a", bytes.NewBufferString(`{"humanColor":"black"}`))
+		if resp.Code != http.StatusCreated {
+			t.Fatalf("create owner-a status = %d", resp.Code)
+		}
+	}
+	resp := requestWithOwner(t, handler, http.MethodPost, "/api/games", "owner-b", bytes.NewBufferString(`{"humanColor":"black"}`))
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create owner-b status = %d", resp.Code)
+	}
+
+	mine := requestJSON(t, handler, http.MethodGet, "/api/games?owner=owner-a", "", nil)
+	var mineGames []GameListItem
+	decodeResponse(t, mine, &mineGames)
+	if len(mineGames) != 2 {
+		t.Fatalf("owner-a games = %d, want 2", len(mineGames))
+	}
+
+	all := requestJSON(t, handler, http.MethodGet, "/api/games", "", nil)
+	var allGames []GameListItem
+	decodeResponse(t, all, &allGames)
+	if len(allGames) != 3 {
+		t.Fatalf("all games = %d, want 3", len(allGames))
+	}
+}
+
+func TestForbiddenMoveEndsGame(t *testing.T) {
+	handler, closeStore := newTestHandler(t)
+	defer closeStore()
+
+	createResponse := requestJSON(t, handler, http.MethodPost, "/api/games", "", bytes.NewBufferString(`{"humanColor":"black","forbidden":true}`))
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", createResponse.Code, createResponse.Body.String())
+	}
+	var created GameResponse
+	decodeResponse(t, createResponse, &created)
+	gamePath := "/api/games/" + created.GameID
+
+	move := func(token string, row, col int) *httptest.ResponseRecorder {
+		body := bytes.NewBufferString(fmt.Sprintf(`{"row":%d,"col":%d}`, row, col))
+		return requestJSON(t, handler, http.MethodPost, gamePath+"/moves", token, body)
+	}
+
+	// Black builds two open threes (horizontal 7,5/7,6 and vertical 5,7/6,7) while
+	// white plays harmless stones; the final black stone at (7,7) is a double-three.
+	type step struct {
+		token    string
+		row, col int
+	}
+	steps := []step{
+		{created.HumanToken, 7, 5},
+		{created.AgentToken, 0, 0},
+		{created.HumanToken, 7, 6},
+		{created.AgentToken, 0, 1},
+		{created.HumanToken, 5, 7},
+		{created.AgentToken, 0, 2},
+		{created.HumanToken, 6, 7},
+		{created.AgentToken, 0, 3},
+	}
+	for i, s := range steps {
+		if resp := move(s.token, s.row, s.col); resp.Code != http.StatusOK {
+			t.Fatalf("step %d move status = %d, body = %s", i, resp.Code, resp.Body.String())
+		}
+	}
+
+	final := move(created.HumanToken, 7, 7)
+	if final.Code != http.StatusOK {
+		t.Fatalf("final move status = %d, body = %s", final.Code, final.Body.String())
+	}
+	var after GameResponse
+	decodeResponse(t, final, &after)
+	if after.Status != game.StatusWhiteWon || after.EndReason != game.EndReasonForbidden {
+		t.Fatalf("expected forbidden loss for black: status=%s reason=%s", after.Status, after.EndReason)
+	}
+}
+
+func TestForbiddenPointsExposedToAgent(t *testing.T) {
+	handler, closeStore := newTestHandler(t)
+	defer closeStore()
+
+	createResponse := requestJSON(t, handler, http.MethodPost, "/api/games", "", bytes.NewBufferString(`{"humanColor":"black","forbidden":true}`))
+	var created GameResponse
+	decodeResponse(t, createResponse, &created)
+	gamePath := "/api/games/" + created.GameID
+	move := func(token string, row, col int) *httptest.ResponseRecorder {
+		return requestJSON(t, handler, http.MethodPost, gamePath+"/moves", token, bytes.NewBufferString(fmt.Sprintf(`{"row":%d,"col":%d}`, row, col)))
+	}
+	// Black builds two pending threes (horizontal 7,5/7,6 and vertical 5,7/6,7);
+	// white plays harmless spaced stones. (7,7) becomes a 三三 forbidden point.
+	steps := []struct {
+		token    string
+		row, col int
+	}{
+		{created.HumanToken, 7, 5}, {created.AgentToken, 0, 0},
+		{created.HumanToken, 7, 6}, {created.AgentToken, 0, 2},
+		{created.HumanToken, 5, 7}, {created.AgentToken, 0, 4},
+		{created.HumanToken, 6, 7}, {created.AgentToken, 0, 6},
+	}
+	for i, s := range steps {
+		if resp := move(s.token, s.row, s.col); resp.Code != http.StatusOK {
+			t.Fatalf("step %d move status = %d, body = %s", i, resp.Code, resp.Body.String())
+		}
+	}
+
+	read := requestJSON(t, handler, http.MethodGet, gamePath, "", nil)
+	var state GameResponse
+	decodeResponse(t, read, &state)
+	if state.NextTurn != game.Human {
+		t.Fatalf("expected black (human) to move, got %s", state.NextTurn)
+	}
+	found := false
+	for _, p := range state.ForbiddenPoints {
+		if p.Row == 7 && p.Col == 7 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected (7,7) in forbiddenPoints, got %+v", state.ForbiddenPoints)
+	}
+}
+
+func requestWithOwner(t *testing.T, handler http.Handler, method string, path string, owner string, body *bytes.Buffer) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader *bytes.Reader
+	if body == nil {
+		reader = bytes.NewReader(nil)
+	} else {
+		reader = bytes.NewReader(body.Bytes())
+	}
+	request := httptest.NewRequest(method, path, reader)
+	request.Header.Set("Content-Type", "application/json")
+	if owner != "" {
+		request.Header.Set("X-Owner-Id", owner)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
 }
 
 func newTestHandler(t *testing.T) (http.Handler, func()) {

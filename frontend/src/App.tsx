@@ -18,11 +18,20 @@ type GameMode = 'human-agent' | 'agent-agent';
 type Player = '' | 'human' | 'agent' | 'agent_black' | 'agent_white';
 type AgentRole = 'agent' | 'agent_black' | 'agent_white';
 type Status = 'playing' | 'draw' | 'black_won' | 'white_won';
-type EndReason = '' | 'five_in_row' | 'draw' | 'resignation';
+type EndReason = '' | 'five_in_row' | 'draw' | 'resignation' | 'forbidden';
+type AgentStrategy = 'think' | 'script';
+type HistoryScope = 'mine' | 'all';
+type WizardStep = 'mode' | 'color' | 'forbidden' | 'strategy' | 'confirm';
 
 type Point = {
   row: number;
   col: number;
+};
+
+type ForbiddenPoint = {
+  row: number;
+  col: number;
+  reason: string;
 };
 
 type Move = {
@@ -48,6 +57,8 @@ type GameState = {
   boardSize: number;
   humanColor: Color;
   agentColor: Color;
+  forbidden: boolean;
+  agentStrategy: AgentStrategy;
   agentState: AgentState;
   agentStates: Partial<Record<AgentRole, AgentState>>;
   humanToken?: string;
@@ -62,6 +73,7 @@ type GameState = {
   winnerRole?: Player;
   resignedBy?: Player;
   winLine: Point[];
+  forbiddenPoints?: ForbiddenPoint[];
   board: Color[][];
   moves: Move[];
   moveCount: number;
@@ -74,6 +86,7 @@ type GameListItem = {
   mode: GameMode;
   humanColor: Color;
   agentColor: Color;
+  forbidden: boolean;
   agentState: AgentState;
   agentStates: Partial<Record<AgentRole, AgentState>>;
   nextTurn?: Player;
@@ -108,7 +121,15 @@ type AgentEntry = {
   state: AgentState;
 };
 
+type NewGameOptions = {
+  mode: GameMode;
+  humanColor: StoneColor;
+  forbidden: boolean;
+  agentStrategy: AgentStrategy;
+};
+
 const tokenStorageKey = 'wuziqi.agentBattle.tokens.v1';
+const ownerStorageKey = 'wuziqi.ownerId.v1';
 const configuredApiBase = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '');
 const apiBase = configuredApiBase;
 const emptyAgentState: AgentState = {
@@ -119,15 +140,29 @@ const emptyAgentState: AgentState = {
 export function App() {
   const [game, setGame] = useState<GameState | null>(null);
   const [history, setHistory] = useState<GameListItem[]>([]);
-  const [gameMode, setGameMode] = useState<GameMode>('human-agent');
-  const [humanColor, setHumanColor] = useState<StoneColor>('black');
+  const [historyScope, setHistoryScope] = useState<HistoryScope>('mine');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [copiedPrompt, setCopiedPrompt] = useState<AgentRole | ''>('');
   const [showResignConfirm, setShowResignConfirm] = useState(false);
+  const [pendingForbidden, setPendingForbidden] = useState<ForbiddenPoint | null>(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [wizardStep, setWizardStep] = useState(0);
+  const [draftMode, setDraftMode] = useState<GameMode>('human-agent');
+  const [draftColor, setDraftColor] = useState<StoneColor>('black');
+  const [draftForbidden, setDraftForbidden] = useState(false);
+  const [draftStrategy, setDraftStrategy] = useState<AgentStrategy>('think');
 
+  const ownerId = useMemo(() => readOwnerId(), []);
   const storedTokens = useMemo(() => readTokenStore(), [game?.gameId, history.length]);
+  const forbiddenMap = useMemo(() => {
+    const map = new Map<string, ForbiddenPoint>();
+    for (const point of game?.forbiddenPoints || []) {
+      map.set(pointKey(point.row, point.col), point);
+    }
+    return map;
+  }, [game?.forbiddenPoints]);
   const activeTokens = game ? storedTokens[game.gameId] : undefined;
   const humanToken = game?.humanToken || activeTokens?.humanToken;
   const canHumanMove = Boolean(
@@ -149,15 +184,21 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [game?.gameId, game?.status]);
 
+  useEffect(() => {
+    void refreshHistory();
+    // refreshHistory reads the latest historyScope/ownerId from its closure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyScope]);
+
   async function bootstrap() {
     setLoading(true);
     try {
-      const games = await listGames();
+      const games = await listGames(historyScope === 'mine' ? ownerId : undefined);
       setHistory(games);
       if (games.length > 0) {
         await loadGame(games[0].gameId);
       } else {
-        await createGame('human-agent', 'black');
+        openWizard();
       }
     } catch (error) {
       setMessage(errorMessage(error));
@@ -167,7 +208,7 @@ export function App() {
   }
 
   async function refreshHistory() {
-    const games = await listGames();
+    const games = await listGames(historyScope === 'mine' ? ownerId : undefined);
     setHistory(games);
   }
 
@@ -176,10 +217,6 @@ export function App() {
     try {
       const nextGame = withStoredTokens(await getGame(gameId));
       setGame(nextGame);
-      setGameMode(nextGame.mode);
-      if (nextGame.humanColor) {
-        setHumanColor(nextGame.humanColor);
-      }
       setMessage('');
     } catch (error) {
       setMessage(errorMessage(error));
@@ -203,12 +240,21 @@ export function App() {
     }
   }
 
-  async function createGame(mode: GameMode, color: StoneColor) {
+  async function createGame(options: NewGameOptions): Promise<boolean> {
     setBusy(true);
     try {
+      const body: Record<string, unknown> = {
+        mode: options.mode,
+        forbidden: options.forbidden,
+        agentStrategy: options.agentStrategy,
+      };
+      if (options.mode === 'human-agent') {
+        body.humanColor = options.humanColor;
+      }
       const nextGame = await api<GameState>('/api/games', {
         method: 'POST',
-        body: JSON.stringify(mode === 'human-agent' ? { mode, humanColor: color } : { mode }),
+        headers: { 'X-Owner-Id': ownerId },
+        body: JSON.stringify(body),
       });
       saveTokens(nextGame.gameId, {
         humanToken: nextGame.humanToken || '',
@@ -217,18 +263,42 @@ export function App() {
         agentWhiteToken: nextGame.agentWhiteToken || '',
       });
       setGame(nextGame);
-      setGameMode(mode);
-      if (nextGame.humanColor) {
-        setHumanColor(nextGame.humanColor);
-      }
       setCopiedPrompt('');
       setShowResignConfirm(false);
       setMessage('');
       await refreshHistory();
+      return true;
     } catch (error) {
       setMessage(errorMessage(error));
+      return false;
     } finally {
       setBusy(false);
+    }
+  }
+
+  function openWizard() {
+    setDraftMode('human-agent');
+    setDraftColor('black');
+    setDraftForbidden(false);
+    setDraftStrategy('think');
+    setWizardStep(0);
+    setMessage('');
+    setWizardOpen(true);
+  }
+
+  function closeWizard() {
+    setWizardOpen(false);
+    setWizardStep(0);
+  }
+
+  async function confirmWizard() {
+    if (await createGame({
+      mode: draftMode,
+      humanColor: draftColor,
+      forbidden: draftForbidden,
+      agentStrategy: draftStrategy,
+    })) {
+      closeWizard();
     }
   }
 
@@ -253,6 +323,27 @@ export function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function handleCellClick(row: number, col: number) {
+    if (!game || !canHumanMove || game.board[row]?.[col]) {
+      return;
+    }
+    const forbidden = forbiddenMap.get(pointKey(row, col));
+    if (forbidden) {
+      setPendingForbidden(forbidden);
+      return;
+    }
+    void placeHumanMove(row, col);
+  }
+
+  async function confirmForbiddenMove() {
+    if (!pendingForbidden) {
+      return;
+    }
+    const { row, col } = pendingForbidden;
+    setPendingForbidden(null);
+    await placeHumanMove(row, col);
   }
 
   function requestHumanResign() {
@@ -312,6 +403,13 @@ export function App() {
   const lastMove = game?.moves.at(-1);
   const winSet = new Set((game?.winLine || []).map((point) => pointKey(point.row, point.col)));
 
+  const wizardSteps: WizardStep[] =
+    draftMode === 'agent-agent'
+      ? ['mode', 'forbidden', 'strategy', 'confirm']
+      : ['mode', 'color', 'forbidden', 'strategy', 'confirm'];
+  const currentWizardStep = wizardSteps[Math.min(wizardStep, wizardSteps.length - 1)];
+  const isLastWizardStep = wizardStep >= wizardSteps.length - 1;
+
   return (
     <div className="app">
       <header className="topbar">
@@ -352,15 +450,22 @@ export function App() {
                   rowValues.map((cell, col) => {
                     const isLast = lastMove?.row === row && lastMove?.col === col;
                     const isWin = winSet.has(pointKey(row, col));
+                    const isForbidden = !cell && forbiddenMap.has(pointKey(row, col));
                     return (
                       <button
                         key={`${row}-${col}`}
-                        className={`cell ${isLast ? 'last' : ''} ${isWin ? 'winning' : ''}`}
-                        aria-label={`${row},${col}${cell ? ` ${colorLabel(cell)}` : ''}`}
+                        className={`cell ${isLast ? 'last' : ''} ${isWin ? 'winning' : ''} ${isForbidden ? 'forbidden' : ''}`}
+                        aria-label={`${row},${col}${cell ? ` ${colorLabel(cell)}` : isForbidden ? ' 禁手点' : ''}`}
                         disabled={!canHumanMove || Boolean(cell)}
-                        onClick={() => void placeHumanMove(row, col)}
+                        onClick={() => handleCellClick(row, col)}
                       >
-                        {cell ? <span className={`stone ${cell}`} /> : <span className="hover-stone" />}
+                        {cell ? (
+                          <span className={`stone ${cell}`} />
+                        ) : isForbidden ? (
+                          <span className="forbidden-mark" aria-hidden="true" />
+                        ) : (
+                          <span className="hover-stone" />
+                        )}
                       </button>
                     );
                   }),
@@ -374,45 +479,11 @@ export function App() {
           <section className="control-block">
             <div className="section-title">
               <User size={18} />
-              <h2>新棋局</h2>
+              <h2>新对局</h2>
             </div>
-            <div className="segmented" aria-label="选择对战模式">
-              <button
-                className={gameMode === 'human-agent' ? 'active' : ''}
-                onClick={() => setGameMode('human-agent')}
-                disabled={busy}
-              >
-                人机
-              </button>
-              <button
-                className={gameMode === 'agent-agent' ? 'active' : ''}
-                onClick={() => setGameMode('agent-agent')}
-                disabled={busy}
-              >
-                机机
-              </button>
-            </div>
-            {gameMode === 'human-agent' ? (
-              <div className="segmented" aria-label="选择人类棋色">
-                <button
-                  className={humanColor === 'black' ? 'active' : ''}
-                  onClick={() => setHumanColor('black')}
-                  disabled={busy}
-                >
-                  我执黑
-                </button>
-                <button
-                  className={humanColor === 'white' ? 'active' : ''}
-                  onClick={() => setHumanColor('white')}
-                  disabled={busy}
-                >
-                  我执白
-                </button>
-              </div>
-            ) : null}
-            <button className="primary-button" onClick={() => void createGame(gameMode, humanColor)} disabled={busy}>
+            <button className="primary-button" onClick={openWizard} disabled={busy}>
               <Plus size={18} />
-              <span>{gameMode === 'agent-agent' ? '创建机机局' : '创建人机局'}</span>
+              <span>新建对局</span>
             </button>
             {game?.mode === 'human-agent' ? (
               <button className="resign-button" onClick={requestHumanResign} disabled={!canAttemptHumanResign}>
@@ -483,17 +554,39 @@ export function App() {
               <History size={18} />
               <h2>历史棋局</h2>
             </div>
+            <div className="segmented" aria-label="选择历史范围">
+              <button
+                className={historyScope === 'mine' ? 'active' : ''}
+                onClick={() => setHistoryScope('mine')}
+                disabled={busy}
+              >
+                我的对局
+              </button>
+              <button
+                className={historyScope === 'all' ? 'active' : ''}
+                onClick={() => setHistoryScope('all')}
+                disabled={busy}
+              >
+                全部对局
+              </button>
+            </div>
             <div className="history-list">
-              {history.map((item) => (
-                <button
-                  key={item.gameId}
-                  className={`history-row ${item.gameId === game?.gameId ? 'selected' : ''}`}
-                  onClick={() => void loadGame(item.gameId)}
-                >
-                  <span>{shortId(item.gameId)}</span>
-                  <span>{historyLabel(item)}</span>
-                </button>
-              ))}
+              {history.length === 0 ? (
+                <div className="history-empty">
+                  {historyScope === 'mine' ? '还没有自己的对局，点上方“新建对局”开始。' : '还没有任何对局。'}
+                </div>
+              ) : (
+                history.map((item) => (
+                  <button
+                    key={item.gameId}
+                    className={`history-row ${item.gameId === game?.gameId ? 'selected' : ''}`}
+                    onClick={() => void loadGame(item.gameId)}
+                  >
+                    <span>{shortId(item.gameId)}</span>
+                    <span>{historyLabel(item)}</span>
+                  </button>
+                ))
+              )}
             </div>
           </section>
 
@@ -503,22 +596,160 @@ export function App() {
               <h2>落子</h2>
             </div>
             <ol className="move-list">
-              {(game?.moves || []).slice(-12).map((move) => (
-                <li key={move.moveNumber}>
-                  <span>{move.moveNumber}</span>
-                  <strong>{colorLabel(move.color)}</strong>
-                  <span>{playerLabel(move.player, game || undefined)}</span>
-                  <span>
+              {(game?.moves || []).slice(-12).reverse().map((move, index) => (
+                <li key={move.moveNumber} className={index === 0 ? 'latest' : ''}>
+                  <span className="move-no">{move.moveNumber}</span>
+                  <span className={`move-stone ${move.color}`} role="img" aria-label={colorLabel(move.color)} />
+                  <span className="move-player">{playerLabel(move.player, game || undefined)}</span>
+                  <span className="move-coord">
                     {move.row},{move.col}
                   </span>
                 </li>
               ))}
+              {game && game.moves.length === 0 ? <li className="move-empty">还没有落子</li> : null}
             </ol>
           </section>
 
           {message ? <div className="message">{message}</div> : null}
         </aside>
       </main>
+
+      {wizardOpen ? (
+        <div className="modal-backdrop" role="presentation">
+          <div className="confirm-dialog wizard-dialog" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
+            <h2 id="wizard-title">新建对局</h2>
+            <p className="wizard-steps">
+              第 {Math.min(wizardStep, wizardSteps.length - 1) + 1} / {wizardSteps.length} 步
+            </p>
+            <div className="wizard-body">
+              {currentWizardStep === 'mode' ? (
+                <div className="wizard-field">
+                  <span className="wizard-label">对战模式</span>
+                  <div className="segmented">
+                    <button className={draftMode === 'human-agent' ? 'active' : ''} onClick={() => setDraftMode('human-agent')}>
+                      人机
+                    </button>
+                    <button className={draftMode === 'agent-agent' ? 'active' : ''} onClick={() => setDraftMode('agent-agent')}>
+                      机机
+                    </button>
+                  </div>
+                  <p className="wizard-hint">
+                    {draftMode === 'human-agent' ? '你与一个 Agent 对弈。' : '两个 Agent 各执黑白互相对弈，你旁观。'}
+                  </p>
+                </div>
+              ) : null}
+              {currentWizardStep === 'color' ? (
+                <div className="wizard-field">
+                  <span className="wizard-label">我方执子</span>
+                  <div className="segmented">
+                    <button className={draftColor === 'black' ? 'active' : ''} onClick={() => setDraftColor('black')}>
+                      执黑先手
+                    </button>
+                    <button className={draftColor === 'white' ? 'active' : ''} onClick={() => setDraftColor('white')}>
+                      执白后手
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              {currentWizardStep === 'forbidden' ? (
+                <div className="wizard-field">
+                  <span className="wizard-label">禁手规则</span>
+                  <div className="segmented">
+                    <button className={!draftForbidden ? 'active' : ''} onClick={() => setDraftForbidden(false)}>
+                      无禁手
+                    </button>
+                    <button className={draftForbidden ? 'active' : ''} onClick={() => setDraftForbidden(true)}>
+                      开启禁手
+                    </button>
+                  </div>
+                  <p className="wizard-hint">开启后，黑棋走出三三 / 四四 / 长连即判负，白棋不受限。</p>
+                </div>
+              ) : null}
+              {currentWizardStep === 'strategy' ? (
+                <div className="wizard-field">
+                  <span className="wizard-label">Agent 对战方式</span>
+                  <div className="segmented">
+                    <button className={draftStrategy === 'think' ? 'active' : ''} onClick={() => setDraftStrategy('think')}>
+                      逐步思考
+                    </button>
+                    <button className={draftStrategy === 'script' ? 'active' : ''} onClick={() => setDraftStrategy('script')}>
+                      生成脚本
+                    </button>
+                  </div>
+                  <p className="wizard-hint">
+                    {draftStrategy === 'think'
+                      ? '复制提示词给外部 LLM，它每一步实时读盘分析后落子。'
+                      : '提示词改为让外部 LLM 先写一个自带 AI 的脚本，由脚本自动循环调用接口对战。'}
+                  </p>
+                </div>
+              ) : null}
+              {currentWizardStep === 'confirm' ? (
+                <dl className="wizard-summary">
+                  <div>
+                    <dt>对战模式</dt>
+                    <dd>{draftMode === 'agent-agent' ? '机机' : '人机'}</dd>
+                  </div>
+                  {draftMode === 'human-agent' ? (
+                    <div>
+                      <dt>我方执子</dt>
+                      <dd>{draftColor === 'black' ? '执黑先手' : '执白后手'}</dd>
+                    </div>
+                  ) : null}
+                  <div>
+                    <dt>禁手规则</dt>
+                    <dd>{draftForbidden ? '开启' : '无'}</dd>
+                  </div>
+                  <div>
+                    <dt>Agent 方式</dt>
+                    <dd>{draftStrategy === 'think' ? '逐步思考' : '生成脚本'}</dd>
+                  </div>
+                </dl>
+              ) : null}
+            </div>
+            <div className="dialog-actions">
+              {wizardStep > 0 ? (
+                <button className="secondary-button" onClick={() => setWizardStep((step) => Math.max(0, step - 1))} disabled={busy}>
+                  上一步
+                </button>
+              ) : (
+                <button className="secondary-button" onClick={closeWizard} disabled={busy}>
+                  取消
+                </button>
+              )}
+              {isLastWizardStep ? (
+                <button className="primary-button" onClick={() => void confirmWizard()} disabled={busy}>
+                  <Plus size={18} />
+                  <span>创建并开始</span>
+                </button>
+              ) : (
+                <button className="primary-button" onClick={() => setWizardStep((step) => step + 1)} disabled={busy}>
+                  <span>下一步</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pendingForbidden ? (
+        <div className="modal-backdrop" role="presentation">
+          <div className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="forbidden-title">
+            <h2 id="forbidden-title">禁手预警</h2>
+            <p>
+              ({pendingForbidden.row}, {pendingForbidden.col}) 是{forbiddenReasonLabel(pendingForbidden.reason)}禁手点，落子将立即判负。确定要走这里吗？
+            </p>
+            <div className="dialog-actions">
+              <button className="secondary-button" onClick={() => setPendingForbidden(null)} disabled={busy}>
+                取消
+              </button>
+              <button className="danger-button" onClick={() => void confirmForbiddenMove()} disabled={busy}>
+                <Flag size={18} />
+                <span>仍然落子</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {showResignConfirm ? (
         <div className="modal-backdrop" role="presentation">
@@ -549,6 +780,9 @@ function StatusPill({ game, loading }: { game: GameState | null; loading: boolea
     return <div className="status-pill neutral">平局</div>;
   }
   if (game.winner) {
+    if (game.endReason === 'forbidden') {
+      return <div className="status-pill ended">黑棋禁手判负</div>;
+    }
     if (game.endReason === 'resignation') {
       return <div className="status-pill ended">{playerLabel(game.resignedBy, game)}认输</div>;
     }
@@ -597,12 +831,30 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
-function listGames() {
-  return api<GameListItem[]>('/api/games?limit=20');
+function listGames(owner?: string) {
+  const ownerParam = owner ? `&owner=${encodeURIComponent(owner)}` : '';
+  return api<GameListItem[]>(`/api/games?limit=20${ownerParam}`);
 }
 
 function getGame(gameId: string) {
   return api<GameState>(`/api/games/${gameId}`);
+}
+
+function readOwnerId(): string {
+  try {
+    const existing = window.localStorage.getItem(ownerStorageKey);
+    if (existing) {
+      return existing;
+    }
+    const generated =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `owner-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    window.localStorage.setItem(ownerStorageKey, generated);
+    return generated;
+  } catch {
+    return '';
+  }
 }
 
 function readTokenStore(): Record<string, StoredTokens> {
@@ -637,12 +889,42 @@ function withStoredTokens(game: GameState): GameState {
   };
 }
 
+function forbiddenRuleText(game: GameState) {
+  return game.forbidden
+    ? '本局开启禁手（仅限黑棋）：黑棋走出长连（6 子及以上）、四四或三三即判负；黑棋先连成恰好 5 子则获胜。白棋不受任何限制。'
+    : '本局没有禁手规则，任意一方先连成 5 子或更多即获胜。';
+}
+
+// forbiddenAgentNote tells a black agent how to read the server-published禁手点
+// set so it can avoid losing. It is empty unless this agent plays black under 禁手.
+function forbiddenAgentNote(game: GameState, color: StoneColor) {
+  if (!game.forbidden || color !== 'black') {
+    return '';
+  }
+  return '\n- 你执黑：轮到你时，返回 JSON 的 "forbiddenPoints" 字段（[{row,col,reason}]）会列出当前所有禁手点；落子前必须从候选点中排除它们，落在禁手点会立即判负。';
+}
+
 function buildAgentPrompt(game: GameState, role: AgentRole, token: string) {
   const baseUrl = configuredApiBase || window.location.origin;
   const color = agentColorForRole(game, role);
   const opponent = game.mode === 'agent-agent' ? oppositeAgentLabel(role) : `人类（${colorLabel(game.humanColor)}）`;
-  const expectedTurn = role;
   const waitTarget = game.mode === 'agent-agent' ? '另一位 Agent' : '人类';
+  if (game.agentStrategy === 'script') {
+    return buildScriptAgentPrompt(game, role, token, baseUrl, color, opponent);
+  }
+  return buildThinkAgentPrompt(game, role, token, baseUrl, color, opponent, waitTarget);
+}
+
+function buildThinkAgentPrompt(
+  game: GameState,
+  role: AgentRole,
+  token: string,
+  baseUrl: string,
+  color: StoneColor,
+  opponent: string,
+  waitTarget: string,
+) {
+  const expectedTurn = role;
   return `你是一个通过 HTTP 接口参加五子棋对战的 Agent。
 
 棋局信息：
@@ -659,7 +941,7 @@ function buildAgentPrompt(game: GameState, role: AgentRole, token: string) {
 - API 坐标是 0-based，row 和 col 都是 0 到 14。
 - 黑棋先手。
 - 横向、纵向、任一斜向连续 5 枚或更多同色棋子即获胜。
-- 本局没有禁手规则。
+- ${forbiddenRuleText(game)}${forbiddenAgentNote(game, color)}
 
 参加方式：
 1. 先加入棋局，让页面知道你已经接管 Agent：
@@ -692,6 +974,61 @@ function buildAgentPrompt(game: GameState, role: AgentRole, token: string) {
 请你自主选择最优落子。不要调用任何不存在的接口，不要在 nextTurn 不是 "${expectedTurn}" 或 nextColor 不是 "${color}" 时落子。`;
 }
 
+function buildScriptAgentPrompt(
+  game: GameState,
+  role: AgentRole,
+  token: string,
+  baseUrl: string,
+  color: StoneColor,
+  opponent: string,
+) {
+  const forbiddenLine =
+    game.forbidden && color === 'black'
+      ? `- 你执黑且本局开启禁手：用返回的 forbiddenPoints 字段排除所有禁手点（落在禁手点立即判负），不必自己重算禁手。在挑选落点前先这样过滤候选：
+    // JavaScript
+    const banned = new Set((state.forbiddenPoints || []).map(p => p.row + ',' + p.col));
+    candidates = candidates.filter(m => !banned.has(m.row + ',' + m.col));
+    # Python
+    banned = {(p["row"], p["col"]) for p in state.get("forbiddenPoints", [])}
+    candidates = [m for m in candidates if (m["row"], m["col"]) not in banned]`
+      : '';
+  return `你是一名工程师，请为下面这局五子棋编写一个“可独立运行的脚本”来代替你自动落子。直接产出完整可运行的代码（Node.js 18+ 用内置 fetch，或 Python 3 用 requests），脚本启动后自己跑完整局对战，你不需要每一步再介入。
+
+棋局信息：
+- baseUrl: ${baseUrl}
+- gameId: ${game.gameId}
+- agentToken: ${token}
+- 你的身份(nextTurn 取值): ${role}
+- 你的棋色: ${color}
+- 对手: ${opponent}
+- 对战模式: ${game.mode}
+
+规则：
+- 棋盘 15x15，坐标 0-based（row、col 均 0..14），黑棋先手。
+- 横、纵、任一斜向连续 5 枚或更多同色即获胜。
+- ${forbiddenRuleText(game)}
+
+HTTP 接口（路径相对 baseUrl，统一带鉴权头 Authorization: Bearer ${token}）：
+- POST /api/games/${game.gameId}/agent/join                                  启动时调用一次，加入棋局
+- GET  /api/games/${game.gameId}                                             读取棋局，返回 JSON
+- POST /api/games/${game.gameId}/agent/status  body {"thinking":true|false}  标记是否在思考
+- POST /api/games/${game.gameId}/moves         body {"row":R,"col":C}         落子
+- POST /api/games/${game.gameId}/resign                                      认输（立即结束）
+返回 JSON 关键字段：status("playing"|"draw"|"black_won"|"white_won")、nextTurn、nextColor("black"|"white")、board（15x15 数组，空位 ""、黑 "black"、白 "white"）；当你执黑且开启禁手时还有 forbiddenPoints（[{row,col,reason}]，列出当前所有禁手点）。
+
+脚本应实现的循环：
+1. 启动时 POST /agent/join。
+2. 轮询 GET 棋局；若 status 不是 "playing" 则结束退出。
+3. 仅当 nextTurn == "${role}" 且 nextColor == "${color}" 时才轮到你：先 POST /agent/status {"thinking":true}，用本地算法在 board 上算出落点，POST /moves 落子，再 POST /agent/status {"thinking":false}。
+4. 否则等待约 1 秒后回到第 2 步。
+5. 对 409/401 等错误要容错：重新读取棋局后再试，不要直接崩溃。
+
+本地落子算法（请实现一个合理的启发式，不要随机乱下）：
+- 自己能立即成五就成五；对手出现“四”（差一子成五）必须封堵。
+- 否则给每个空点打分：扩展自己的连子/活三/活四加分，封堵对手威胁加分，靠近棋盘中心略加分，取最高分的点。
+${forbiddenLine ? forbiddenLine + '\n' : ''}请只输出完整脚本代码与简短运行说明（如何填入 baseUrl/gameId/token 及启动命令），不要省略关键逻辑，不要调用不存在的接口。`;
+}
+
 async function copyText(text: string) {
   let clipboardError: unknown;
   if (navigator.clipboard?.writeText && window.isSecureContext) {
@@ -719,6 +1056,23 @@ async function copyText(text: string) {
   document.body.removeChild(textarea);
   if (!copied) {
     throw clipboardError instanceof Error ? clipboardError : new Error('复制失败，请确认浏览器允许剪贴板访问');
+  }
+}
+
+function strategyLabel(strategy: AgentStrategy) {
+  return strategy === 'script' ? '生成脚本' : '逐步思考';
+}
+
+function forbiddenReasonLabel(reason: string) {
+  switch (reason) {
+    case 'overline':
+      return '长连';
+    case 'double_four':
+      return '四四';
+    case 'double_three':
+      return '三三';
+    default:
+      return '';
   }
 }
 
@@ -753,6 +1107,9 @@ function historyLabel(item: GameListItem) {
     return `平局 ${item.moveCount} 手`;
   }
   if (item.winner) {
+    if (item.endReason === 'forbidden') {
+      return `黑棋禁手 ${item.moveCount} 手`;
+    }
     if (item.endReason === 'resignation') {
       return `${playerLabel(item.resignedBy, item)}认输 ${item.moveCount} 手`;
     }
@@ -830,6 +1187,8 @@ function gameMetaItems(game: GameState) {
       { label: '模式', value: '机机对战' },
       { label: '黑棋', value: '黑棋 Agent' },
       { label: '白棋', value: '白棋 Agent' },
+      { label: '禁手', value: game.forbidden ? '开启' : '无' },
+      { label: 'Agent 方式', value: strategyLabel(game.agentStrategy) },
       { label: '手数', value: String(game.moveCount) },
     ];
   }
@@ -838,6 +1197,8 @@ function gameMetaItems(game: GameState) {
     { label: '模式', value: '人机对战' },
     { label: '我方', value: colorLabel(game.humanColor) },
     { label: 'Agent', value: colorLabel(game.agentColor) },
+    { label: '禁手', value: game.forbidden ? '开启' : '无' },
+    { label: 'Agent 方式', value: strategyLabel(game.agentStrategy) },
     { label: '手数', value: String(game.moveCount) },
   ];
 }

@@ -54,6 +54,8 @@ type GameResponse struct {
 	BoardSize       int                        `json:"boardSize"`
 	HumanColor      game.Color                 `json:"humanColor"`
 	AgentColor      game.Color                 `json:"agentColor"`
+	Forbidden       bool                       `json:"forbidden"`
+	AgentStrategy   string                     `json:"agentStrategy"`
 	AgentState      AgentState                 `json:"agentState"`
 	AgentStates     map[game.Player]AgentState `json:"agentStates"`
 	HumanToken      string                     `json:"humanToken,omitempty"`
@@ -68,6 +70,7 @@ type GameResponse struct {
 	WinnerRole      game.Player                `json:"winnerRole,omitempty"`
 	ResignedBy      game.Player                `json:"resignedBy,omitempty"`
 	WinLine         []game.Point               `json:"winLine"`
+	ForbiddenPoints []game.ForbiddenPoint      `json:"forbiddenPoints,omitempty"`
 	Board           [][]game.Color             `json:"board"`
 	Moves           []game.Move                `json:"moves"`
 	MoveCount       int                        `json:"moveCount"`
@@ -88,6 +91,7 @@ type GameListItem struct {
 	Mode        game.Mode                  `json:"mode"`
 	HumanColor  game.Color                 `json:"humanColor"`
 	AgentColor  game.Color                 `json:"agentColor"`
+	Forbidden   bool                       `json:"forbidden"`
 	AgentState  AgentState                 `json:"agentState"`
 	AgentStates map[game.Player]AgentState `json:"agentStates"`
 	NextTurn    game.Player                `json:"nextTurn,omitempty"`
@@ -158,8 +162,11 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		Mode       string `json:"mode"`
-		HumanColor string `json:"humanColor"`
+		Mode          string `json:"mode"`
+		HumanColor    string `json:"humanColor"`
+		Forbidden     bool   `json:"forbidden"`
+		AgentStrategy string `json:"agentStrategy"`
+		Owner         string `json:"owner"`
 	}
 	if r.Body != nil {
 		defer r.Body.Close()
@@ -187,7 +194,24 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	g, err := s.store.CreateGame(r.Context(), mode, humanColor)
+	// The anonymous owner id scopes "my games". Prefer the header so the move /
+	// status / resign decoders (which DisallowUnknownFields) stay untouched, and
+	// fall back to the body field for clients that cannot set custom headers.
+	owner := strings.TrimSpace(r.Header.Get("X-Owner-Id"))
+	if owner == "" {
+		owner = strings.TrimSpace(request.Owner)
+	}
+	if len(owner) > 64 {
+		owner = owner[:64]
+	}
+
+	g, err := s.store.CreateGame(r.Context(), store.CreateOptions{
+		Mode:          mode,
+		HumanColor:    humanColor,
+		Forbidden:     request.Forbidden,
+		AgentStrategy: game.NormalizeStrategy(request.AgentStrategy),
+		OwnerID:       owner,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create game failed")
 		return
@@ -206,7 +230,15 @@ func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
 		limit = parsed
 	}
 
-	games, err := s.store.ListGames(r.Context(), limit)
+	var (
+		games []game.Game
+		err   error
+	)
+	if owner := strings.TrimSpace(r.URL.Query().Get("owner")); owner != "" {
+		games, err = s.store.ListGamesByOwner(r.Context(), owner, limit)
+	} else {
+		games, err = s.store.ListGames(r.Context(), limit)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list games failed")
 		return
@@ -341,32 +373,39 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request, gameID strin
 
 func newGameResponse(g game.Game, includeTokens bool) GameResponse {
 	response := GameResponse{
-		GameID:      g.ID,
-		Mode:        g.NormalizedMode(),
-		BoardSize:   game.BoardSize,
-		HumanColor:  g.HumanColor,
-		AgentColor:  g.AgentColor,
-		AgentState:  newAgentState(g),
-		AgentStates: newAgentStates(g),
-		NextTurn:    g.NextPlayer(),
-		NextColor:   g.NextColor,
-		Status:      g.Status,
-		EndReason:   g.EndReason,
-		Winner:      g.WinnerColor,
-		WinnerRole:  g.WinnerPlayer(),
-		ResignedBy:  resignedBy(g),
-		WinLine:     g.WinLine,
-		Board:       game.BuildBoard(g.Moves),
-		Moves:       g.Moves,
-		MoveCount:   g.MoveCount,
-		CreatedAt:   g.CreatedAt,
-		UpdatedAt:   g.UpdatedAt,
+		GameID:        g.ID,
+		Mode:          g.NormalizedMode(),
+		BoardSize:     game.BoardSize,
+		HumanColor:    g.HumanColor,
+		AgentColor:    g.AgentColor,
+		Forbidden:     g.Forbidden,
+		AgentStrategy: game.NormalizeStrategy(g.AgentStrategy),
+		AgentState:    newAgentState(g),
+		AgentStates:   newAgentStates(g),
+		NextTurn:      g.NextPlayer(),
+		NextColor:     g.NextColor,
+		Status:        g.Status,
+		EndReason:     g.EndReason,
+		Winner:        g.WinnerColor,
+		WinnerRole:    g.WinnerPlayer(),
+		ResignedBy:    resignedBy(g),
+		WinLine:       g.WinLine,
+		Board:         game.BuildBoard(g.Moves),
+		Moves:         g.Moves,
+		MoveCount:     g.MoveCount,
+		CreatedAt:     g.CreatedAt,
+		UpdatedAt:     g.UpdatedAt,
 	}
 	if response.WinLine == nil {
 		response.WinLine = []game.Point{}
 	}
 	if response.Moves == nil {
 		response.Moves = []game.Move{}
+	}
+	// Publish forbidden points only when 禁手 is on and black is to move — this is
+	// the single source the board's ✕ warnings and the agent's API both consume.
+	if g.Forbidden && g.Status == game.StatusPlaying && g.NextColor == game.Black {
+		response.ForbiddenPoints = game.ForbiddenPointsForBlack(game.BuildBoard(g.Moves))
 	}
 	if includeTokens {
 		response.HumanToken = g.HumanToken
@@ -383,6 +422,7 @@ func newGameListItem(g game.Game) GameListItem {
 		Mode:        g.NormalizedMode(),
 		HumanColor:  g.HumanColor,
 		AgentColor:  g.AgentColor,
+		Forbidden:   g.Forbidden,
 		AgentState:  newAgentState(g),
 		AgentStates: newAgentStates(g),
 		NextTurn:    g.NextPlayer(),

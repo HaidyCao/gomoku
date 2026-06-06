@@ -45,7 +45,7 @@ func TestPurgeStaleGames(t *testing.T) {
 	ctx := context.Background()
 
 	// Old finished game with a move — should be purged together with its move.
-	oldFinished, err := s.CreateGame(ctx, game.ModeHumanAgent, game.Black)
+	oldFinished, err := s.CreateGame(ctx, CreateOptions{Mode: game.ModeHumanAgent, HumanColor: game.Black})
 	if err != nil {
 		t.Fatalf("create old finished: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestPurgeStaleGames(t *testing.T) {
 	backdate(t, s, oldFinished.ID, 200*time.Hour)
 
 	// Recent finished game — should be kept.
-	recentFinished, err := s.CreateGame(ctx, game.ModeHumanAgent, game.Black)
+	recentFinished, err := s.CreateGame(ctx, CreateOptions{Mode: game.ModeHumanAgent, HumanColor: game.Black})
 	if err != nil {
 		t.Fatalf("create recent finished: %v", err)
 	}
@@ -70,14 +70,14 @@ func TestPurgeStaleGames(t *testing.T) {
 	}
 
 	// Old abandoned in-progress game — should be purged.
-	oldActive, err := s.CreateGame(ctx, game.ModeHumanAgent, game.Black)
+	oldActive, err := s.CreateGame(ctx, CreateOptions{Mode: game.ModeHumanAgent, HumanColor: game.Black})
 	if err != nil {
 		t.Fatalf("create old active: %v", err)
 	}
 	backdate(t, s, oldActive.ID, 48*time.Hour)
 
 	// Recent in-progress game — should be kept.
-	recentActive, err := s.CreateGame(ctx, game.ModeHumanAgent, game.Black)
+	recentActive, err := s.CreateGame(ctx, CreateOptions{Mode: game.ModeHumanAgent, HumanColor: game.Black})
 	if err != nil {
 		t.Fatalf("create recent active: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestPurgeStaleGamesDisabledCategories(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
-	old, err := s.CreateGame(ctx, game.ModeHumanAgent, game.Black)
+	old, err := s.CreateGame(ctx, CreateOptions{Mode: game.ModeHumanAgent, HumanColor: game.Black})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -130,6 +130,76 @@ func TestPurgeStaleGamesDisabledCategories(t *testing.T) {
 	}
 	if _, err := s.GetGame(ctx, old.ID); err != nil {
 		t.Fatalf("game should remain when purge disabled: %v", err)
+	}
+}
+
+func TestCreateGamePersistsOptions(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	created, err := s.CreateGame(ctx, CreateOptions{
+		Mode:          game.ModeHumanAgent,
+		HumanColor:    game.Black,
+		Forbidden:     true,
+		AgentStrategy: "script",
+		OwnerID:       "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := s.GetGame(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.Forbidden || got.AgentStrategy != game.StrategyScript || got.OwnerID != "owner-1" {
+		t.Fatalf("options not persisted: forbidden=%v strategy=%q owner=%q", got.Forbidden, got.AgentStrategy, got.OwnerID)
+	}
+}
+
+func TestCreateGameDefaults(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	created, err := s.CreateGame(ctx, CreateOptions{Mode: game.ModeHumanAgent, HumanColor: game.Black})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := s.GetGame(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Forbidden || got.AgentStrategy != game.StrategyThink || got.OwnerID != "" {
+		t.Fatalf("unexpected defaults: forbidden=%v strategy=%q owner=%q", got.Forbidden, got.AgentStrategy, got.OwnerID)
+	}
+}
+
+func TestListGamesByOwner(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := s.CreateGame(ctx, CreateOptions{Mode: game.ModeHumanAgent, HumanColor: game.Black, OwnerID: "u1"}); err != nil {
+			t.Fatalf("create u1: %v", err)
+		}
+	}
+	if _, err := s.CreateGame(ctx, CreateOptions{Mode: game.ModeHumanAgent, HumanColor: game.Black, OwnerID: "u2"}); err != nil {
+		t.Fatalf("create u2: %v", err)
+	}
+
+	mine, err := s.ListGamesByOwner(ctx, "u1", 20)
+	if err != nil {
+		t.Fatalf("list u1: %v", err)
+	}
+	if len(mine) != 2 {
+		t.Fatalf("u1 games = %d, want 2", len(mine))
+	}
+	all, err := s.ListGames(ctx, 20)
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("all games = %d, want 3", len(all))
 	}
 }
 

@@ -56,7 +56,7 @@ VITE_API_BASE=http://localhost:8090 npm run dev
 ## API
 
 - `POST /api/games`
-- `GET /api/games?limit=20`
+- `GET /api/games?limit=20`（加 `&owner=<id>` 只看某个匿名归属的对局）
 - `GET /api/games/{gameId}`
 - `POST /api/games/{gameId}/agent/join`
 - `POST /api/games/{gameId}/agent/status`
@@ -67,16 +67,22 @@ VITE_API_BASE=http://localhost:8090 npm run dev
 创建人机局：
 
 ```json
-{ "mode": "human-agent", "humanColor": "black" }
+{ "mode": "human-agent", "humanColor": "black", "forbidden": false, "agentStrategy": "think" }
 ```
 
 创建机机局：
 
 ```json
-{ "mode": "agent-agent" }
+{ "mode": "agent-agent", "forbidden": false, "agentStrategy": "think" }
 ```
 
 `mode` 默认是 `human-agent`，人机局会返回 `humanToken` 和 `agentToken`；机机局会返回 `agentBlackToken` 和 `agentWhiteToken`。
+
+创建对局时可选字段：
+
+- `forbidden`（默认 `false`）：开启后仅对黑棋启用连珠禁手（严格递归判定），黑棋走出长连（6 子及以上）、四四或三三即判负（`status` 变为 `white_won`、`endReason` 为 `forbidden`）；黑棋先成恰好 5 子仍判胜，白棋不受限。开启禁手且轮到黑棋时，棋局 JSON 会带上 `forbiddenPoints`（`[{row,col,reason}]`，列出当前所有禁手点），供前端标 ✕ 预警、Agent 落子前规避。
+- `agentStrategy`（`think` | `script`，默认 `think`）：仅影响前端“复制提示词”生成的内容（逐步思考 / 让 LLM 先写脚本自动对战），随对局持久化。
+- 归属标识：创建时通过请求头 `X-Owner-Id: <id>`（或请求体 `owner` 字段）写入匿名归属，配合 `GET /api/games?owner=<id>` 实现“只看我的对局”。该归属仅用于列表筛选，不是访问控制，所有对局仍可凭 `gameId` 公开查看。
 
 落子接口使用 `Authorization: Bearer <token>`，后端通过 token 自动判断调用者身份。
 认输接口使用任一方 token 自动判断认输者；Agent 加入和思考状态接口使用对应 Agent token。机机局中 `nextTurn` 会是 `agent_black` 或 `agent_white`。
