@@ -1,0 +1,24 @@
+services:
+  gomoku:
+    build: .
+    image: gomoku
+    container_name: gomoku
+    restart: unless-stopped
+    # Publish only to loopback; the public edge is the nginx reverse proxy.
+    # This also prevents clients from reaching the app directly and spoofing
+    # X-Forwarded-For to evade rate limiting.
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Running behind a trusted reverse proxy, so honour X-Forwarded-For for
+      # per-IP rate limiting and request logs. Remove this if exposed directly.
+      TRUST_PROXY_HEADERS: "true"
+      # ADDR, DB_PATH, STATIC_DIR and rate-limit defaults come from the image.
+      # Retention defaults: finished games kept 7d, abandoned games 24h.
+    volumes:
+      - gomoku-data:/var/lib/gomoku
+    # Allow the in-process graceful drain (~20s) to finish before SIGKILL.
+    stop_grace_period: 30s
+
+volumes:
+  gomoku-data:

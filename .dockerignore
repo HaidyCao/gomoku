@@ -1,0 +1,7 @@
+.git
+data/
+frontend/dist/
+frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
+*.log
+.DS_Store
