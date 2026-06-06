@@ -1,13 +1,17 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"wuziqi/internal/game"
@@ -15,9 +19,34 @@ import (
 )
 
 type Server struct {
-	store     *store.SQLiteStore
-	staticDir string
+	store         *store.SQLiteStore
+	staticDir     string
+	config        Config
+	rateLimiter   *rateLimiter
+	createLimiter *rateLimiter
+	logger        *slog.Logger
 }
+
+type Config struct {
+	AllowedOrigins   []string
+	MaxJSONBodyBytes int64
+	RateLimit        RateLimitConfig
+	// CreateRateLimit is a stricter, separate per-IP budget for POST /api/games
+	// so unauthenticated game creation cannot be used to flood the database.
+	CreateRateLimit RateLimitConfig
+	// TrustProxyHeaders controls whether X-Forwarded-For / X-Real-IP are used to
+	// derive the client IP. Enable ONLY when running behind a trusted reverse
+	// proxy; otherwise clients could spoof these headers to evade rate limits.
+	TrustProxyHeaders bool
+}
+
+type RateLimitConfig struct {
+	Enabled           bool
+	RequestsPerWindow int
+	Window            time.Duration
+}
+
+const defaultMaxJSONBodyBytes int64 = 16 * 1024
 
 type GameResponse struct {
 	GameID          string                     `json:"gameId"`
@@ -74,9 +103,18 @@ type GameListItem struct {
 }
 
 func New(store *store.SQLiteStore, staticDir string) *Server {
+	return NewWithConfig(store, staticDir, Config{})
+}
+
+func NewWithConfig(store *store.SQLiteStore, staticDir string, config Config) *Server {
+	config = normalizeConfig(config)
 	return &Server{
-		store:     store,
-		staticDir: staticDir,
+		store:         store,
+		staticDir:     staticDir,
+		config:        config,
+		rateLimiter:   newRateLimiter(config.RateLimit),
+		createLimiter: newRateLimiter(config.CreateRateLimit),
+		logger:        slog.Default(),
 	}
 }
 
@@ -86,12 +124,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/games", s.handleGames)
 	mux.HandleFunc("/api/games/", s.handleGame)
 	mux.Handle("/", spaHandler(s.staticDir))
-	return cors(mux)
+	return s.requestLog(s.securityHeaders(s.cors(s.rateLimit(mux))))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.store.Ping(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "degraded"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -109,6 +153,10 @@ func (s *Server) handleGames(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
+	if s.createLimiter != nil && !s.createLimiter.allow(s.clientIP(r), time.Now()) {
+		writeError(w, http.StatusTooManyRequests, "too many new games from this client, slow down")
+		return
+	}
 	var request struct {
 		Mode       string `json:"mode"`
 		HumanColor string `json:"humanColor"`
@@ -116,8 +164,8 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		defer r.Body.Close()
 	}
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := decodeJSON(w, r, s.config.MaxJSONBodyBytes, &request); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 	mode, err := game.NormalizeMode(request.Mode)
@@ -247,8 +295,8 @@ func (s *Server) handleAgentStatus(w http.ResponseWriter, r *http.Request, gameI
 		Thinking bool `json:"thinking"`
 	}
 	defer r.Body.Close()
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := decodeJSON(w, r, s.config.MaxJSONBodyBytes, &request); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 
@@ -272,8 +320,8 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request, gameID strin
 		Col int `json:"col"`
 	}
 	defer r.Body.Close()
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := decodeJSON(w, r, s.config.MaxJSONBodyBytes, &request); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 
@@ -439,16 +487,110 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func cors(next http.Handler) http.Handler {
+func decodeJSON(w http.ResponseWriter, r *http.Request, maxBytes int64, target any) error {
+	if maxBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target)
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesError *http.MaxBytesError
+	if errors.As(err, &maxBytesError) {
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("JSON body must be at most %d bytes", maxBytesError.Limit))
+		return
+	}
+	writeError(w, http.StatusBadRequest, "invalid JSON body")
+}
+
+func (s *Server) cors(next http.Handler) http.Handler {
+	allowedOrigins := originSet(s.config.AllowedOrigins)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		origin := r.Header.Get("Origin")
+		if origin != "" && allowedOrigins[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		}
 		if r.Method == http.MethodOptions {
+			if origin != "" && !allowedOrigins[origin] {
+				writeError(w, http.StatusForbidden, "origin not allowed")
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) rateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.rateLimiter != nil && shouldRateLimit(r) {
+			if !s.rateLimiter.allow(s.clientIP(r), time.Now()) {
+				writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// statusRecorder captures the response status code so the request logger can
+// report it. It defaults to 200, matching net/http's implicit status.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (rec *statusRecorder) WriteHeader(code int) {
+	rec.status = code
+	rec.wrote = true
+	rec.ResponseWriter.WriteHeader(code)
+}
+
+func (rec *statusRecorder) Write(b []byte) (int, error) {
+	if !rec.wrote {
+		rec.wrote = true
+	}
+	return rec.ResponseWriter.Write(b)
+}
+
+func (s *Server) requestLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+
+		level := slog.LevelInfo
+		switch {
+		case r.URL.Path == "/api/health":
+			level = slog.LevelDebug
+		case rec.status >= 500:
+			level = slog.LevelError
+		case rec.status >= 400:
+			level = slog.LevelWarn
+		}
+		s.logger.LogAttrs(r.Context(), level, "http request",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", rec.status),
+			slog.Duration("duration", time.Since(start)),
+			slog.String("ip", s.clientIP(r)),
+		)
 	})
 }
 
@@ -477,4 +619,129 @@ func spaHandler(staticDir string) http.Handler {
 		}
 		http.ServeFile(w, r, indexPath)
 	})
+}
+
+func normalizeConfig(config Config) Config {
+	if config.MaxJSONBodyBytes <= 0 {
+		config.MaxJSONBodyBytes = defaultMaxJSONBodyBytes
+	}
+	if config.RateLimit.RequestsPerWindow <= 0 {
+		config.RateLimit.RequestsPerWindow = 300
+	}
+	if config.RateLimit.Window <= 0 {
+		config.RateLimit.Window = time.Minute
+	}
+	if config.CreateRateLimit.RequestsPerWindow <= 0 {
+		config.CreateRateLimit.RequestsPerWindow = 10
+	}
+	if config.CreateRateLimit.Window <= 0 {
+		config.CreateRateLimit.Window = time.Minute
+	}
+	return config
+}
+
+func originSet(origins []string) map[string]bool {
+	set := make(map[string]bool, len(origins))
+	for _, origin := range origins {
+		origin = strings.TrimSpace(origin)
+		if origin != "" {
+			set[origin] = true
+		}
+	}
+	return set
+}
+
+func shouldRateLimit(r *http.Request) bool {
+	if r.Method == http.MethodOptions || r.URL.Path == "/api/health" {
+		return false
+	}
+	if r.URL.Path == "/api/games" {
+		return r.Method == http.MethodPost || r.Method == http.MethodGet
+	}
+	if !strings.HasPrefix(r.URL.Path, "/api/games/") {
+		return false
+	}
+	if r.Method != http.MethodPost {
+		return false
+	}
+	return strings.HasSuffix(r.URL.Path, "/moves") || strings.HasSuffix(r.URL.Path, "/agent/status")
+}
+
+// clientIP derives the client address used for rate limiting and logging. It
+// only honours proxy-supplied headers when TrustProxyHeaders is set, so a
+// directly-exposed server cannot be tricked into trusting a spoofed
+// X-Forwarded-For / X-Real-IP.
+func (s *Server) clientIP(r *http.Request) string {
+	if s.config.TrustProxyHeaders {
+		// Cloudflare sets CF-Connecting-IP to the real visitor IP. Prefer it:
+		// unlike X-Forwarded-For (whose first hop is client-spoofable), it is a
+		// single trusted value, and behind a tunnel the origin cannot be reached
+		// directly to forge it.
+		if cfIP := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cfIP != "" {
+			return cfIP
+		}
+		if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
+			if first := strings.TrimSpace(strings.Split(forwardedFor, ",")[0]); first != "" {
+				return first
+			}
+		}
+		if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+			return realIP
+		}
+	}
+	host := r.RemoteAddr
+	if index := strings.LastIndex(host, ":"); index > -1 {
+		return host[:index]
+	}
+	return host
+}
+
+type rateLimiter struct {
+	config RateLimitConfig
+	mu     sync.Mutex
+	hits   map[string]rateLimitWindow
+}
+
+type rateLimitWindow struct {
+	count   int
+	resetAt time.Time
+}
+
+func newRateLimiter(config RateLimitConfig) *rateLimiter {
+	if !config.Enabled {
+		return nil
+	}
+	return &rateLimiter{
+		config: config,
+		hits:   make(map[string]rateLimitWindow),
+	}
+}
+
+func (l *rateLimiter) allow(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	window := l.hits[key]
+	if window.resetAt.IsZero() || !now.Before(window.resetAt) {
+		l.hits[key] = rateLimitWindow{count: 1, resetAt: now.Add(l.config.Window)}
+		l.cleanup(now)
+		return true
+	}
+	if window.count >= l.config.RequestsPerWindow {
+		return false
+	}
+	window.count++
+	l.hits[key] = window
+	return true
+}
+
+func (l *rateLimiter) cleanup(now time.Time) {
+	if len(l.hits) < 1024 {
+		return
+	}
+	for key, window := range l.hits {
+		if !now.Before(window.resetAt) {
+			delete(l.hits, key)
+		}
+	}
 }

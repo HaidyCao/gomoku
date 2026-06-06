@@ -298,13 +298,145 @@ func TestListGames(t *testing.T) {
 	}
 }
 
+func TestConfiguredCORS(t *testing.T) {
+	handler, closeStore := newTestHandlerWithConfig(t, Config{
+		AllowedOrigins: []string{"https://gomoku.example.com"},
+	})
+	defer closeStore()
+
+	request := httptest.NewRequest(http.MethodOptions, "/api/games", nil)
+	request.Header.Set("Origin", "https://gomoku.example.com")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("allowed preflight status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Access-Control-Allow-Origin"); got != "https://gomoku.example.com" {
+		t.Fatalf("allow origin header = %q", got)
+	}
+
+	blocked := httptest.NewRequest(http.MethodOptions, "/api/games", nil)
+	blocked.Header.Set("Origin", "https://evil.example")
+	blockedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(blockedResponse, blocked)
+	if blockedResponse.Code != http.StatusForbidden {
+		t.Fatalf("blocked preflight status = %d, body = %s", blockedResponse.Code, blockedResponse.Body.String())
+	}
+	if got := blockedResponse.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("blocked origin should not get CORS header, got %q", got)
+	}
+}
+
+func TestJSONBodyLimit(t *testing.T) {
+	handler, closeStore := newTestHandlerWithConfig(t, Config{MaxJSONBodyBytes: 8})
+	defer closeStore()
+
+	response := requestJSON(t, handler, http.MethodPost, "/api/games", "", bytes.NewBufferString(`{"humanColor":"black"}`))
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("large body status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	handler, closeStore := newTestHandlerWithConfig(t, Config{
+		RateLimit: RateLimitConfig{
+			Enabled:           true,
+			RequestsPerWindow: 2,
+		},
+	})
+	defer closeStore()
+
+	for i := 0; i < 2; i++ {
+		response := requestJSON(t, handler, http.MethodGet, "/api/games?limit=20", "", nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d, body = %s", i+1, response.Code, response.Body.String())
+		}
+	}
+	limited := requestJSON(t, handler, http.MethodGet, "/api/games?limit=20", "", nil)
+	if limited.Code != http.StatusTooManyRequests {
+		t.Fatalf("limited status = %d, body = %s", limited.Code, limited.Body.String())
+	}
+
+	health := requestJSON(t, handler, http.MethodGet, "/api/health", "", nil)
+	if health.Code != http.StatusOK {
+		t.Fatalf("health should not be rate limited, status = %d, body = %s", health.Code, health.Body.String())
+	}
+}
+
+func TestHealthDegradedWhenStoreClosed(t *testing.T) {
+	handler, closeStore := newTestHandler(t)
+	closeStore() // simulate the database becoming unavailable
+
+	resp := requestJSON(t, handler, http.MethodGet, "/api/health", "", nil)
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("health status = %d, want 503; body = %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestClientIPHonoursTrustProxyHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/games", nil)
+	req.RemoteAddr = "203.0.113.7:5555"
+	req.Header.Set("X-Forwarded-For", "10.9.8.7")
+	req.Header.Set("X-Real-IP", "10.9.8.6")
+
+	untrusted := &Server{config: Config{}}
+	if got := untrusted.clientIP(req); got != "203.0.113.7" {
+		t.Fatalf("untrusted clientIP = %q, want 203.0.113.7 (RemoteAddr)", got)
+	}
+
+	trusted := &Server{config: Config{TrustProxyHeaders: true}}
+	if got := trusted.clientIP(req); got != "10.9.8.7" {
+		t.Fatalf("trusted clientIP = %q, want 10.9.8.7 (X-Forwarded-For)", got)
+	}
+}
+
+func TestClientIPPrefersCloudflareHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/games", nil)
+	req.RemoteAddr = "127.0.0.1:5555" // cloudflared connects from loopback
+	req.Header.Set("CF-Connecting-IP", "198.51.100.23")
+	req.Header.Set("X-Forwarded-For", "10.9.8.7") // spoofable first hop, must be ignored
+
+	trusted := &Server{config: Config{TrustProxyHeaders: true}}
+	if got := trusted.clientIP(req); got != "198.51.100.23" {
+		t.Fatalf("trusted clientIP = %q, want 198.51.100.23 (CF-Connecting-IP)", got)
+	}
+
+	// Without trust, proxy headers (including CF-Connecting-IP) are ignored.
+	untrusted := &Server{config: Config{}}
+	if got := untrusted.clientIP(req); got != "127.0.0.1" {
+		t.Fatalf("untrusted clientIP = %q, want 127.0.0.1 (RemoteAddr)", got)
+	}
+}
+
+func TestCreateRateLimit(t *testing.T) {
+	handler, closeStore := newTestHandlerWithConfig(t, Config{
+		CreateRateLimit: RateLimitConfig{Enabled: true, RequestsPerWindow: 2},
+	})
+	defer closeStore()
+
+	for i := 0; i < 2; i++ {
+		resp := requestJSON(t, handler, http.MethodPost, "/api/games", "", bytes.NewBufferString(`{"humanColor":"black"}`))
+		if resp.Code != http.StatusCreated {
+			t.Fatalf("create %d status = %d, body = %s", i+1, resp.Code, resp.Body.String())
+		}
+	}
+	limited := requestJSON(t, handler, http.MethodPost, "/api/games", "", bytes.NewBufferString(`{"humanColor":"black"}`))
+	if limited.Code != http.StatusTooManyRequests {
+		t.Fatalf("third create status = %d, want 429; body = %s", limited.Code, limited.Body.String())
+	}
+}
+
 func newTestHandler(t *testing.T) (http.Handler, func()) {
+	return newTestHandlerWithConfig(t, Config{})
+}
+
+func newTestHandlerWithConfig(t *testing.T, config Config) (http.Handler, func()) {
 	t.Helper()
 	sqliteStore, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "wuziqi.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	return New(sqliteStore, "").Handler(), func() {
+	return NewWithConfig(sqliteStore, "", config).Handler(), func() {
 		_ = sqliteStore.Close()
 	}
 }

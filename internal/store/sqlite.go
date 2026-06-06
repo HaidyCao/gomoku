@@ -52,7 +52,27 @@ func Open(ctx context.Context, path string) (*SQLiteStore, error) {
 }
 
 func (s *SQLiteStore) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = s.Checkpoint(ctx)
 	return s.db.Close()
+}
+
+// Ping verifies database connectivity. It is safe for concurrent use and
+// honours ctx cancellation, so it can back a health endpoint without blocking
+// on the store mutex.
+func (s *SQLiteStore) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
+// Checkpoint flushes the write-ahead log back into the main database file and
+// truncates it. It runs on graceful shutdown so a restart does not inherit a
+// large .db-wal file.
+func (s *SQLiteStore) Checkpoint(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
 }
 
 func (s *SQLiteStore) configure(ctx context.Context) error {
@@ -60,6 +80,7 @@ func (s *SQLiteStore) configure(ctx context.Context) error {
 		`PRAGMA foreign_keys = ON`,
 		`PRAGMA journal_mode = WAL`,
 		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA wal_autocheckpoint = 1000`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -313,6 +334,43 @@ LIMIT ?`, limit)
 		games = append(games, g)
 	}
 	return games, rows.Err()
+}
+
+// PurgeStaleGames deletes finished games whose last activity predates
+// finishedOlderThan, and abandoned in-progress games whose last activity
+// predates abandonedOlderThan. Matching rows in moves are removed via the
+// games.id ON DELETE CASCADE. A non-positive duration disables that category.
+// It returns the number of games deleted.
+func (s *SQLiteStore) PurgeStaleGames(ctx context.Context, finishedOlderThan, abandonedOlderThan time.Duration) (int64, error) {
+	now := time.Now().UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var deleted int64
+	if finishedOlderThan > 0 {
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM games WHERE status != ? AND updated_at < ?`,
+			game.StatusPlaying, formatTime(now.Add(-finishedOlderThan)))
+		if err != nil {
+			return deleted, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			deleted += n
+		}
+	}
+	if abandonedOlderThan > 0 {
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM games WHERE status = ? AND updated_at < ?`,
+			game.StatusPlaying, formatTime(now.Add(-abandonedOlderThan)))
+		if err != nil {
+			return deleted, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			deleted += n
+		}
+	}
+	return deleted, nil
 }
 
 func (s *SQLiteStore) GetGame(ctx context.Context, id string) (game.Game, error) {
