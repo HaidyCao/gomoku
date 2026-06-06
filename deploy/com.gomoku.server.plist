@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchDaemon for the gomoku server (native binary on a Mac mini).
+
+  Install:
+    # 1. Build and place files (see README "方式 B"):
+    #    /usr/local/bin/gomoku, /usr/local/share/gomoku/frontend/dist
+    sudo mkdir -p /usr/local/var/gomoku /usr/local/var/log
+    sudo chown "$(id -un)" /usr/local/var/gomoku /usr/local/var/log
+    # 2. Replace __MACOS_USER__ with your account, then:
+    sudo sed "s/__MACOS_USER__/$(id -un)/" deploy/com.gomoku.server.plist \
+      | sudo tee /Library/LaunchDaemons/com.gomoku.server.plist >/dev/null
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.gomoku.server.plist
+  Stop / restart:
+    sudo launchctl bootout system/com.gomoku.server      # graceful: sends SIGTERM
+    sudo launchctl kickstart -k system/com.gomoku.server
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gomoku.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/gomoku</string>
+    </array>
+
+    <!-- Run unprivileged. Replace with your macOS account (run: id -un). -->
+    <key>UserName</key>
+    <string>__MACOS_USER__</string>
+
+    <key>WorkingDirectory</key>
+    <string>/usr/local/var/gomoku</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Loopback only: the sole ingress is the Cloudflare tunnel. -->
+        <key>ADDR</key>
+        <string>127.0.0.1:8090</string>
+        <key>DB_PATH</key>
+        <string>/usr/local/var/gomoku/wuziqi.db</string>
+        <key>STATIC_DIR</key>
+        <string>/usr/local/share/gomoku/frontend/dist</string>
+        <!-- Behind Cloudflare: trust CF-Connecting-IP for per-visitor rate limiting. -->
+        <key>TRUST_PROXY_HEADERS</key>
+        <string>true</string>
+        <key>LOG_LEVEL</key>
+        <string>info</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/gomoku.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/gomoku.log</string>
+</dict>
+</plist>

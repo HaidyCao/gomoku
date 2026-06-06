@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job: daily SQLite backup of the gomoku database (runs at 04:00).
+
+  Install:
+    sudo cp deploy/backup.sh /usr/local/bin/gomoku-backup.sh
+    sudo chmod +x /usr/local/bin/gomoku-backup.sh
+    sudo sed "s/__MACOS_USER__/$(id -un)/" deploy/com.gomoku.backup.plist \
+      | sudo tee /Library/LaunchDaemons/com.gomoku.backup.plist >/dev/null
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.gomoku.backup.plist
+  Run once now:
+    sudo launchctl kickstart -k system/com.gomoku.backup
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gomoku.backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/gomoku-backup.sh</string>
+    </array>
+
+    <key>UserName</key>
+    <string>__MACOS_USER__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- macOS ships /usr/bin/sqlite3; keep it on PATH for launchd. -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>DB_PATH</key>
+        <string>/usr/local/var/gomoku/wuziqi.db</string>
+        <key>BACKUP_DIR</key>
+        <string>/usr/local/var/gomoku/backups</string>
+        <key>KEEP</key>
+        <string>14</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/gomoku-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/gomoku-backup.log</string>
+</dict>
+</plist>

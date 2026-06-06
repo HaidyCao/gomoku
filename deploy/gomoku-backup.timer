@@ -1,0 +1,12 @@
+# Example systemd timer: run the gomoku backup daily.
+# Install to /etc/systemd/system/ alongside gomoku-backup.service, then:
+#   systemctl enable --now gomoku-backup.timer
+[Unit]
+Description=Run gomoku database backup daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

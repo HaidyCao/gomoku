@@ -1,0 +1,12 @@
+# Example systemd unit: one-shot gomoku database backup.
+# Install to /etc/systemd/system/ alongside gomoku-backup.timer, adjust the
+# paths, then: systemctl enable --now gomoku-backup.timer
+[Unit]
+Description=Backup gomoku SQLite database
+
+[Service]
+Type=oneshot
+Environment=DB_PATH=/var/lib/gomoku/wuziqi.db
+Environment=BACKUP_DIR=/var/backups/gomoku
+Environment=KEEP=14
+ExecStart=/opt/gomoku/deploy/backup.sh
